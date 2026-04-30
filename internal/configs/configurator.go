@@ -457,21 +457,11 @@ func (cnf *Configurator) buildDefaultServerConfig() version1.IngressNginxConfig 
 
 func (cnf *Configurator) hasActiveEmptyHostIngress() bool {
 	for _, ingEx := range cnf.ingresses {
-		if ingEx != nil && ingEx.ValidHosts[emptyHost] {
+		if ingEx != nil && ingEx.ValidHosts[emptyHostName] {
 			return true
 		}
 	}
 	return false
-}
-
-func (cnf *Configurator) cleanUpStaleIngressConfig(ingressKey string, newIsEmptyHost bool) {
-	current, exists := cnf.ingresses[ingressKey]
-	if !exists {
-		return
-	}
-	if !current.ValidHosts[emptyHost] && newIsEmptyHost {
-		cnf.nginxManager.DeleteConfig(ingressKey)
-	}
 }
 
 func (cnf *Configurator) syncDefaultServerConfig() error {
@@ -522,24 +512,26 @@ func (cnf *Configurator) addOrUpdateIngress(ingEx *IngressEx) (bool, Warnings, e
 		ingressControllerReplicas: cnf.ingressControllerReplicas,
 	})
 
-	ingressKey := objectMetaToFileName(&ingEx.Ingress.ObjectMeta)
-	isEmptyHost := ingEx.ValidHosts[emptyHost]
-
-	configName := ingressKey
-	if isEmptyHost {
-		configName = DefaultServerConfigName
-	}
+	// Resolve the stable ingress map key and the config file to write.
+	ingressKey, configName := getIngressKeyatndConfigName(&ingEx.Ingress.ObjectMeta, ingEx.ValidHosts[emptyHostName])
 
 	content, err := cnf.templateExecutor.ExecuteIngressConfigTemplate(&nginxCfg)
 	if err != nil {
-		return false, warnings, fmt.Errorf("error generating Ingress Config %v: %w", ingressKey, err)
+		return false, warnings, fmt.Errorf("error generating Ingress Config %v: %w", configName, err)
 	}
 	configChanged, err := cnf.nginxManager.CreateConfig(configName, content)
 	if err != nil {
-		return false, warnings, fmt.Errorf("error validating Ingress config %v: %w", ingressKey, err)
+		return false, warnings, fmt.Errorf("error validating Ingress config %v: %w", configName, err)
 	}
 
-	cnf.cleanUpStaleIngressConfig(ingressKey, isEmptyHost)
+	// If this ingress moved from its dedicated config file to the shared
+	// default-server file, remove the stale dedicated file after the new write succeeds.
+	if ingressKey != configName {
+		if current, exists := cnf.ingresses[ingressKey]; exists && !current.ValidHosts[emptyHostName] {
+			// manager API uses file names; here ingressKey is the dedicated config file name.
+			cnf.nginxManager.DeleteConfig(ingressKey)
+		}
+	}
 
 	cnf.ingresses[ingressKey] = ingEx
 	if (cnf.isPlus && cnf.isPrometheusEnabled) || cnf.isLatencyMetricsEnabled {
@@ -600,24 +592,26 @@ func (cnf *Configurator) addOrUpdateMergeableIngress(mergeableIngs *MergeableIng
 		ingressControllerReplicas: cnf.ingressControllerReplicas,
 	})
 
-	ingressKey := objectMetaToFileName(&mergeableIngs.Master.Ingress.ObjectMeta)
-	isEmptyHost := mergeableIngs.Master.ValidHosts[emptyHost]
-
-	configName := ingressKey
-	if isEmptyHost {
-		configName = DefaultServerConfigName
-	}
+	// Resolve the stable ingress map key and the config file to write.
+	ingressKey, configName := getIngressKeyatndConfigName(&mergeableIngs.Master.Ingress.ObjectMeta, mergeableIngs.Master.ValidHosts[emptyHostName])
 
 	content, err := cnf.templateExecutor.ExecuteIngressConfigTemplate(&nginxCfg)
 	if err != nil {
-		return false, warnings, fmt.Errorf("error generating Ingress Config %v: %w", ingressKey, err)
+		return false, warnings, fmt.Errorf("error generating Ingress Config %v: %w", configName, err)
 	}
 	changed, err := cnf.nginxManager.CreateConfig(configName, content)
 	if err != nil {
-		return false, warnings, fmt.Errorf("error validating Ingress config %v: %w", ingressKey, err)
+		return false, warnings, fmt.Errorf("error validating Ingress config %v: %w", configName, err)
 	}
 
-	cnf.cleanUpStaleIngressConfig(ingressKey, isEmptyHost)
+	// If this ingress moved from its dedicated config file to the shared
+	// default-server file, remove the stale dedicated file after the new write succeeds.
+	if ingressKey != configName {
+		if current, exists := cnf.ingresses[ingressKey]; exists && !current.ValidHosts[emptyHostName] {
+			// manager API uses file names; here ingressKey is the dedicated config file name.
+			cnf.nginxManager.DeleteConfig(ingressKey)
+		}
+	}
 
 	cnf.ingresses[ingressKey] = mergeableIngs.Master
 	cnf.minions[ingressKey] = make(map[string]bool)
@@ -1146,7 +1140,7 @@ func GenerateLicenseSecret(secret *api_v1.Secret) ([]byte, error) {
 func (cnf *Configurator) DeleteIngress(key string, skipReload bool) error {
 	name := keyToFileName(key)
 
-	if ingEx, exists := cnf.ingresses[name]; !exists || !ingEx.ValidHosts[emptyHost] {
+	if ingEx, exists := cnf.ingresses[name]; !exists || !ingEx.ValidHosts[emptyHostName] {
 		cnf.nginxManager.DeleteConfig(name)
 	}
 
@@ -1458,7 +1452,7 @@ func (cnf *Configurator) updatePlusEndpoints(ingEx *IngressEx) error {
 			if _, isExternalName := ingEx.ExternalNameSvcs[ingEx.Ingress.Spec.DefaultBackend.Service.Name]; isExternalName {
 				nl.Debugf(l, "Service %s is Type ExternalName, skipping NGINX Plus endpoints update via API", ingEx.Ingress.Spec.DefaultBackend.Service.Name)
 			} else {
-				name := getNameForUpstream(ingEx.Ingress, emptyHost, ingEx.Ingress.Spec.DefaultBackend)
+				name := getNameForUpstream(ingEx.Ingress, emptyHostName, ingEx.Ingress.Spec.DefaultBackend)
 				err := cnf.updateServersInPlus(name, endps, cfg)
 				if err != nil {
 					return fmt.Errorf("couldn't update the endpoints for %v: %w", name, err)
@@ -1795,6 +1789,18 @@ func keyToFileName(key string) string {
 
 func objectMetaToFileName(meta *meta_v1.ObjectMeta) string {
 	return meta.Namespace + "-" + meta.Name
+}
+
+// getIngressKeyatndConfigName returns the stable ingress map key and the config file
+// name to write for this ingress. Hostless ingresses keep their dedicated ingress key
+// in cnf.ingresses, but write to the shared default-server config file.
+func getIngressKeyatndConfigName(meta *meta_v1.ObjectMeta, isEmptyHostIngress bool) (string, string) {
+	configName := objectMetaToFileName(meta)
+	ingressKey := configName
+	if isEmptyHostIngress {
+		return ingressKey, DefaultServerConfigName
+	}
+	return ingressKey, configName
 }
 
 func generateNamespaceNameKey(objectMeta *meta_v1.ObjectMeta) string {
